@@ -12,8 +12,8 @@ android {
         applicationId = "com.deadvault.app"
         minSdk = 30
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
     }
 
     buildTypes {
@@ -65,4 +65,8 @@ dependencies {
 
     // Background deadline checks that survive the app being closed.
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+
+    // Fingerprint / face unlock. BiometricPrompt needs a FragmentActivity.
+    implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.fragment:fragment-ktx:1.8.3")
 }

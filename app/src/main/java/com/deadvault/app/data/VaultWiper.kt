@@ -44,6 +44,7 @@ object VaultWiper {
             keyStore.deleteEntry(MasterKey.DEFAULT_MASTER_KEY_ALIAS)
             keyGone = !keyStore.containsAlias(MasterKey.DEFAULT_MASTER_KEY_ALIAS)
         }
+        BiometricHelper.deleteKey()
         app.deleteSharedPreferences(ENCRYPTED_FILE_PREFS)
         File(app.dataDir, "shared_prefs").listFiles()
             ?.filter { it.name.contains("androidx_security_crypto") }
@@ -55,7 +56,7 @@ object VaultWiper {
 
         // Only report success if the key and the files are really gone. Otherwise the wipe stays
         // pending and the next deadline check retries it.
-        if (!keyGone || vaultDir.exists()) return@synchronized
+        if (!keyGone || !vaultDir.listFiles().isNullOrEmpty()) return@synchronized
 
         prefs.finishWipe(reason, System.currentTimeMillis())
 

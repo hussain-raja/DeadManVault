@@ -26,21 +26,47 @@ data class VaultItem(
     val mime: String,
     val size: Long,
     val addedAt: Long,
+    /** null = main library. */
+    val folderId: String? = null,
 ) {
     val isVideo: Boolean get() = mime.startsWith("video/")
 
-    fun toJson(): String = JSONObject()
-        .put("id", id).put("name", name).put("mime", mime)
-        .put("size", size).put("addedAt", addedAt)
-        .toString()
+    fun toJson(): String {
+        val o = JSONObject()
+            .put("id", id).put("name", name).put("mime", mime)
+            .put("size", size).put("addedAt", addedAt)
+        if (folderId != null) o.put("folderId", folderId)
+        return o.toString()
+    }
 
     companion object {
         fun fromJson(s: String): VaultItem {
             val o = JSONObject(s)
             return VaultItem(
-                o.getString("id"), o.getString("name"), o.getString("mime"),
-                o.getLong("size"), o.getLong("addedAt"),
+                id = o.getString("id"),
+                name = o.getString("name"),
+                mime = o.getString("mime"),
+                size = o.getLong("size"),
+                addedAt = o.getLong("addedAt"),
+                folderId = if (o.isNull("folderId")) null else o.getString("folderId"),
             )
+        }
+    }
+}
+
+data class VaultFolder(
+    val id: String,
+    val name: String,
+    val createdAt: Long,
+) {
+    fun toJson(): String = JSONObject()
+        .put("id", id).put("name", name).put("createdAt", createdAt)
+        .toString()
+
+    companion object {
+        fun fromJson(s: String): VaultFolder {
+            val o = JSONObject(s)
+            return VaultFolder(o.getString("id"), o.getString("name"), o.getLong("createdAt"))
         }
     }
 }
@@ -56,9 +82,14 @@ class VaultStore(context: Context) {
 
     private val app = context.applicationContext
     private val resolver = app.contentResolver
-    // A getter, not a field: the folder is deleted by a wipe and must be recreated for a new vault.
-    private val dir: File get() = File(app.filesDir, DIR_NAME).also { it.mkdirs() }
+    // A getter, not a field: the folder is deleted by a wipe. Reads never create it (a read racing a
+    // wipe must not resurrect the folder); writes go through [writableDir].
+    private val dir: File get() = File(app.filesDir, DIR_NAME)
+    private fun writableDir(): File = dir.also { it.mkdirs() }
     private val playDir = File(app.cacheDir, PLAY_DIR)
+
+    /** Serializes delete-then-create rewrites of encrypted files (EncryptedFile won't overwrite). */
+    private val writeLock = Any()
 
     private val masterKey: MasterKey by lazy {
         MasterKey.Builder(app).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
@@ -69,7 +100,8 @@ class VaultStore(context: Context) {
             app, file, masterKey, EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB,
         ).build()
 
-    private fun writeEncrypted(file: File, bytes: ByteArray) {
+    private fun writeEncrypted(file: File, bytes: ByteArray) = synchronized(writeLock) {
+        file.parentFile?.mkdirs()
         if (file.exists()) file.delete() // EncryptedFile refuses to overwrite
         enc(file).openFileOutput().use { it.write(bytes) }
     }
@@ -79,31 +111,98 @@ class VaultStore(context: Context) {
 
     // ---------------------------------------------------------------- listing
 
+    /**
+     * An item's metadata lives in ".meta" or, after a move, in ".m2" (the two slots alternate so a
+     * crash in the middle of a rewrite can never leave an item without metadata). If both exist,
+     * the more recently written one wins.
+     */
+    private fun isMetaFile(f: File) = f.name.endsWith(".meta") || f.name.endsWith(".m2")
+
     fun listItems(): List<VaultItem> =
-        (dir.listFiles { f -> f.name.endsWith(".meta") } ?: emptyArray())
+        (dir.listFiles { f -> isMetaFile(f) } ?: emptyArray())
+            .sortedByDescending { it.lastModified() }
             .mapNotNull { f ->
                 runCatching { VaultItem.fromJson(String(readEncrypted(f))) }.getOrNull()
             }
+            .distinctBy { it.id }
             .sortedByDescending { it.addedAt }
 
-    /** Removes leftovers of imports that were interrupted before their .meta was written. */
+    /** Removes leftovers of imports that were interrupted before their metadata was written. */
     fun purgeOrphans() {
         val files = dir.listFiles() ?: return
-        val known = files.filter { it.name.endsWith(".meta") }.map { it.name.removeSuffix(".meta") }.toSet()
-        files.filter { it.name.substringBefore('.') !in known }.forEach { it.delete() }
+        val known = files.filter { isMetaFile(it) }.map { it.name.substringBefore('.') }.toSet()
+        files
+            .filter { !it.name.endsWith(".folder") && it.name.substringBefore('.') !in known }
+            .forEach { it.delete() }
     }
+
+    // ---------------------------------------------------------------- folders
+
+    fun listFolders(): List<VaultFolder> =
+        (dir.listFiles { f -> f.name.endsWith(".folder") } ?: emptyArray())
+            .mapNotNull { f ->
+                runCatching { VaultFolder.fromJson(String(readEncrypted(f))) }.getOrNull()
+            }
+            .sortedBy { it.name.lowercase() }
+
+    fun createFolder(name: String): VaultFolder {
+        val folder = VaultFolder(UUID.randomUUID().toString(), name.trim(), System.currentTimeMillis())
+        writeEncrypted(File(dir, "${folder.id}.folder"), folder.toJson().toByteArray())
+        return folder
+    }
+
+    fun renameFolder(folder: VaultFolder, name: String): VaultFolder {
+        val updated = folder.copy(name = name.trim())
+        writeEncrypted(File(dir, "${folder.id}.folder"), updated.toJson().toByteArray())
+        return updated
+    }
+
+    fun deleteFolder(id: String) {
+        File(dir, "$id.folder").delete()
+    }
+
+    /**
+     * Rewrites an item's metadata (used when it is moved between folders): the new copy is written to
+     * the other slot first and the old one removed afterwards.
+     */
+    fun updateItem(item: VaultItem) = synchronized(writeLock) {
+        val d = writableDir()
+        val metaFile = File(d, "${item.id}.meta")
+        val m2File = File(d, "${item.id}.m2")
+        if (metaFile.exists()) {
+            writeEncrypted(m2File, item.toJson().toByteArray())
+            metaFile.delete()
+        } else {
+            writeEncrypted(metaFile, item.toJson().toByteArray())
+            m2File.delete()
+        }
+    }
+
+    /** Reads the whole encrypted file back and checks it decrypts to exactly the bytes we stored. */
+    fun verify(item: VaultItem): Boolean = runCatching {
+        var total = 0L
+        enc(File(dir, "${item.id}.dat")).openFileInput().use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                total += n
+            }
+        }
+        total == item.size && total > 0
+    }.getOrDefault(false)
 
     // ----------------------------------------------------------------- import
 
     /** Copies [uri] into the vault, encrypted. Returns null if anything went wrong. */
-    fun import(uri: Uri): VaultItem? {
-        val mime = resolver.getType(uri) ?: return null
-        if (!mime.startsWith("image/") && !mime.startsWith("video/")) return null
-
+    fun import(uri: Uri, folderId: String? = null): VaultItem? {
         val id = UUID.randomUUID().toString()
-        val dataFile = File(dir, "$id.dat")
         return try {
-            val (name, _) = queryNameAndSize(uri, mime)
+            val mime = resolver.getType(uri) ?: return null
+            if (!mime.startsWith("image/") && !mime.startsWith("video/")) return null
+
+            val dataFile = File(writableDir(), "$id.dat")
+            val (name, declaredSize) = queryNameAndSize(uri, mime)
             var total = 0L
             resolver.openInputStream(uri)!!.use { input ->
                 enc(dataFile).openFileOutput().use { out ->
@@ -116,11 +215,15 @@ class VaultStore(context: Context) {
                     }
                 }
             }
+            // The original may be deleted after this, so a copy that is shorter than the source is a failure.
+            if (total == 0L || (declaredSize >= 0 && total != declaredSize)) {
+                throw java.io.IOException("Copied $total bytes but the source reports $declaredSize")
+            }
             makeThumbnail(uri, mime)?.let { writeEncrypted(File(dir, "$id.thumb"), it) }
-            val item = VaultItem(id, name, mime, total, System.currentTimeMillis())
+            val item = VaultItem(id, name, mime, total, System.currentTimeMillis(), folderId)
             writeEncrypted(File(dir, "$id.meta"), item.toJson().toByteArray())
             item
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             deleteFiles(id)
             null
         }
@@ -146,8 +249,8 @@ class VaultStore(context: Context) {
     private fun makeThumbnail(uri: Uri, mime: String): ByteArray? {
         val bmp: Bitmap = try {
             if (mime.startsWith("video/")) videoFrame(uri) else decodeImage(ImageDecoder.createSource(resolver, uri), THUMB_EDGE)
-        } catch (e: Exception) {
-            null
+        } catch (e: Throwable) {
+            null // a missing thumbnail (even out of memory) must never fail the import
         } ?: return null
         return ByteArrayOutputStream().use { out ->
             bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
@@ -227,7 +330,7 @@ class VaultStore(context: Context) {
     fun delete(id: String) = deleteFiles(id)
 
     private fun deleteFiles(id: String) {
-        listOf("dat", "thumb", "meta").forEach { File(dir, "$id.$it").delete() }
+        listOf("dat", "thumb", "meta", "m2").forEach { File(dir, "$id.$it").delete() }
     }
 
     /** Copies the item back into the public gallery (Pictures/ or Movies/ "DeadVault Restored"). */
@@ -244,7 +347,7 @@ class VaultStore(context: Context) {
             put(MediaStore.MediaColumns.RELATIVE_PATH, "$root/DeadVault Restored")
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
-        val target = resolver.insert(collection, values) ?: return false
+        val target = runCatching { resolver.insert(collection, values) }.getOrNull() ?: return false
         return try {
             resolver.openOutputStream(target)!!.use { out ->
                 enc(File(dir, "${item.id}.dat")).openFileInput().use { it.copyTo(out) }
@@ -263,6 +366,6 @@ class VaultStore(context: Context) {
         const val DIR_NAME = "vault"
         const val PLAY_DIR = "play"
         private const val THUMB_EDGE = 384
-        private const val FULL_EDGE = 2048
+        private const val FULL_EDGE = 3072
     }
 }

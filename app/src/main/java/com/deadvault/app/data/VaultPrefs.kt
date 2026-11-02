@@ -53,6 +53,16 @@ class VaultPrefs(context: Context) {
         get() = sp.getInt(K_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS)
         set(v) = sp.edit().putInt(K_MAX_ATTEMPTS, v).commit().let { }
 
+    /** Fingerprint / face unlock is switched on (the matching Keystore key exists). */
+    var biometricEnabled: Boolean
+        get() = sp.getBoolean(K_BIOMETRIC, false)
+        set(v) = sp.edit().putBoolean(K_BIOMETRIC, v).commit().let { }
+
+    /** Delete the originals from the gallery right after they are safely in the vault. */
+    var autoDeleteOriginals: Boolean
+        get() = sp.getBoolean(K_AUTO_DELETE, true)
+        set(v) = sp.edit().putBoolean(K_AUTO_DELETE, v).commit().let { }
+
     var warned: Boolean
         get() = sp.getBoolean(K_WARNED, false)
         set(v) = sp.edit().putBoolean(K_WARNED, v).apply()
@@ -125,6 +135,8 @@ class VaultPrefs(context: Context) {
         private const val K_FAILED = "failed_attempts"
         private const val K_MAX_ATTEMPTS = "max_attempts"
         private const val K_WARNED = "warned"
+        private const val K_BIOMETRIC = "biometric_enabled"
+        private const val K_AUTO_DELETE = "auto_delete_originals"
         private const val K_PENDING_WIPE = "pending_wipe"
         private const val K_PENDING_REASON = "pending_reason"
         private const val K_NOTICE = "wipe_notice"

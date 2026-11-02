@@ -1,22 +1,28 @@
 package com.deadvault.app.ui
 
 import android.app.Application
-import android.content.ContentUris
 import android.content.IntentSender
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Environment
 import android.os.SystemClock
-import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.LruCache
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.viewModelScope
+import com.deadvault.app.data.BiometricHelper
+import com.deadvault.app.data.BiometricResult
+import com.deadvault.app.data.OriginalDeleter
 import com.deadvault.app.data.PasscodeHasher
 import com.deadvault.app.data.VaultEvents
+import com.deadvault.app.data.VaultFolder
 import com.deadvault.app.data.VaultItem
 import com.deadvault.app.data.VaultPrefs
 import com.deadvault.app.data.VaultStore
@@ -31,6 +37,9 @@ import java.io.File
 /** How long the user may stay in a picker/dialog we opened before the vault re-locks on return. */
 private const val EXTERNAL_GRACE_MS = 5 * 60 * 1000L
 
+/** Ignore automatic biometric prompts for this long after one ended, to avoid prompt loops. */
+private const val BIOMETRIC_COOLDOWN_MS = 2_000L
+
 enum class Phase { Loading, Setup, Locked, Unlocked }
 
 sealed interface Overlay {
@@ -39,6 +48,13 @@ sealed interface Overlay {
     data object Settings : Overlay
 }
 
+private data class ImportResult(
+    val added: List<VaultItem>,
+    val leftoverOriginals: List<Uri>,
+    val failed: Int,
+    val deleted: Int,
+)
+
 class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
 
     private val prefs = VaultPrefs(app)
@@ -46,7 +62,17 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
 
     var phase by mutableStateOf(Phase.Loading); private set
     var overlay by mutableStateOf<Overlay>(Overlay.None); private set
+
     val items = mutableStateListOf<VaultItem>()
+    val folders = mutableStateListOf<VaultFolder>()
+
+    /** null = main library. */
+    var currentFolderId by mutableStateOf<String?>(null); private set
+    val currentFolder: VaultFolder? get() = folders.firstOrNull { it.id == currentFolderId }
+
+    /** The items shown in the gallery right now (main library or the open folder). */
+    val visibleItems: List<VaultItem> by derivedStateOf { items.filter { it.folderId == currentFolderId } }
+
     var selection by mutableStateOf<Set<String>>(emptySet()); private set
 
     var remainingMs by mutableStateOf(0L); private set
@@ -54,8 +80,19 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
     var message by mutableStateOf<String?>(null)
     var wipeNotice by mutableStateOf<String?>(null); private set
     var busy by mutableStateOf(false); private set
+
+    /** A long import / restore is running. Unlike [busy] it never blocks unlocking. */
+    var working by mutableStateOf(false); private set
     var maxAttempts by mutableStateOf(prefs.maxAttempts); private set
     var intervalMs by mutableStateOf(prefs.intervalMs); private set
+
+    var biometricEnabled by mutableStateOf(prefs.biometricEnabled); private set
+
+    /** Bumped when the lock screen should (re)start the biometric prompt on its own. */
+    var biometricTrigger by mutableStateOf(0); private set
+
+    var autoDelete by mutableStateOf(prefs.autoDeleteOriginals); private set
+    var hasAllFilesAccess by mutableStateOf(Environment.isExternalStorageManager()); private set
 
     /** Set when the system "allow DeadVault to delete these originals?" dialog should be shown. */
     var deleteRequest by mutableStateOf<IntentSender?>(null)
@@ -66,6 +103,13 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
     /** Time of a stop we skipped because a picker/dialog was opening; 0 = none pending. */
     private var suppressedStopAt = 0L
     private var enforcing = false
+
+    private var biometricShowing = false
+    private var lastBiometricEnd = 0L
+
+    /** Set by "Lock now" so the lock screen doesn't immediately pop the fingerprint prompt again. */
+    private var skipNextAutoPrompt = false
+
     private val thumbs = object : LruCache<String, Bitmap>(96) {}
 
     init {
@@ -86,6 +130,8 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
         phase = if (prefs.isSetUp) Phase.Locked else Phase.Setup
         maxAttempts = prefs.maxAttempts
         intervalMs = prefs.intervalMs
+        biometricEnabled = prefs.biometricEnabled
+        autoDelete = prefs.autoDeleteOriginals
     }
 
     private fun onWiped() {
@@ -103,7 +149,9 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
     fun onResumed() {
         expireIfStale()
         suppressedStopAt = 0L
+        refreshPermissions()
         if (phase == Phase.Loading) return
+        if (phase == Phase.Locked) biometricTrigger++
         viewModelScope.launch {
             withContext(Dispatchers.IO) { DeadlineEnforcer.check(app) }
             tick()
@@ -132,6 +180,10 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { store.clearPlayback() }
     }
 
+    fun refreshPermissions() {
+        hasAllFilesAccess = Environment.isExternalStorageManager()
+    }
+
     fun tick() {
         if (phase == Phase.Loading || phase == Phase.Setup) return
         val remaining = DeadlineEnforcer.remainingMs(app) ?: return
@@ -150,10 +202,18 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
         if (prefs.isSetUp) phase = Phase.Locked
     }
 
+    /** The lock button: lock, and wait for the user to ask for biometrics again. */
+    fun lockNow() {
+        skipNextAutoPrompt = true
+        lock()
+    }
+
     private fun clearSession() {
         overlay = Overlay.None
         selection = emptySet()
         items.clear()
+        folders.clear()
+        currentFolderId = null
         thumbs.evictAll()
         deleteRequest = null
         error = null
@@ -186,8 +246,12 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
             }
             this@VaultViewModel.intervalMs = intervalMs
             maxAttempts = prefs.maxAttempts
+            biometricEnabled = false
+            autoDelete = prefs.autoDeleteOriginals
             wipeNotice = null
             items.clear()
+            folders.clear()
+            currentFolderId = null
             busy = false
             tick()
             phase = Phase.Unlocked
@@ -201,23 +265,44 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val outcome = withContext(Dispatchers.IO) { tryUnlock(passcode) }
             busy = false
-            when (outcome) {
-                is Unlock.Ok -> {
-                    items.clear()
-                    items.addAll(outcome.items)
-                    tick()
-                    phase = Phase.Unlocked
-                }
-                is Unlock.Wrong -> error = outcome.message
-                Unlock.Wiped -> refreshPhaseFromDisk() // normally onWiped() has already done this
-            }
+            handleUnlock(outcome)
         }
     }
 
+    private fun handleUnlock(outcome: Unlock) {
+        when (outcome) {
+            is Unlock.Ok -> enter(outcome)
+            is Unlock.Wrong -> error = outcome.message
+            Unlock.Wiped -> refreshPhaseFromDisk() // normally onWiped() has already done this
+        }
+    }
+
+    private fun enter(ok: Unlock.Ok) {
+        items.clear()
+        items.addAll(ok.items)
+        folders.clear()
+        folders.addAll(ok.folders)
+        currentFolderId = null
+        tick()
+        phase = Phase.Unlocked
+    }
+
     private sealed interface Unlock {
-        data class Ok(val items: List<VaultItem>) : Unlock
+        data class Ok(val items: List<VaultItem>, val folders: List<VaultFolder>) : Unlock
         data class Wrong(val message: String) : Unlock
         data object Wiped : Unlock
+    }
+
+    private fun loadVault(): Unlock.Ok {
+        store.purgeOrphans()
+        val loadedFolders = store.listFolders()
+        val folderIds = loadedFolders.map { it.id }.toSet()
+        // An item whose folder record is missing is shown in the main library instead of vanishing.
+        val loadedItems = store.listItems().map { item ->
+            val fid = item.folderId
+            if (fid != null && fid !in folderIds) item.copy(folderId = null) else item
+        }
+        return Unlock.Ok(loadedItems, loadedFolders)
     }
 
     private fun tryUnlock(passcode: String): Unlock {
@@ -230,8 +315,7 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
 
         if (PasscodeHasher.verify(passcode, salt, hash, prefs.iterations)) {
             DeadlineEnforcer.markUnlocked(app)
-            store.purgeOrphans()
-            return Unlock.Ok(store.listItems())
+            return loadVault()
         }
 
         val failed = prefs.failedAttempts + 1
@@ -251,6 +335,98 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
         )
     }
 
+    // ----------------------------------------------------------- biometrics
+
+    /** Shows the fingerprint / face prompt on the lock screen. */
+    fun requestBiometric(activity: FragmentActivity, auto: Boolean) {
+        if (phase != Phase.Locked || !biometricEnabled || biometricShowing || busy) return
+        // BiometricPrompt silently does nothing (and never calls back) unless the activity is on screen.
+        if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) ||
+            activity.supportFragmentManager.isStateSaved
+        ) return
+        if (auto && skipNextAutoPrompt) {
+            skipNextAutoPrompt = false
+            return
+        }
+        if (auto && SystemClock.elapsedRealtime() - lastBiometricEnd < BIOMETRIC_COOLDOWN_MS) return
+        biometricShowing = true
+        BiometricHelper.authenticate(activity, "Unlock DeadVault", "Use passcode") { result ->
+            biometricShowing = false
+            lastBiometricEnd = SystemClock.elapsedRealtime()
+            when (result) {
+                BiometricResult.Success -> unlockWithBiometric()
+                BiometricResult.KeyInvalid -> disableBiometricBecauseInvalidated()
+                BiometricResult.Cancelled -> Unit
+                is BiometricResult.Error -> error = result.message
+            }
+        }
+    }
+
+    private fun unlockWithBiometric() {
+        // A wipe may have happened while the prompt was open: never open a vault that no longer exists.
+        if (busy || phase != Phase.Locked || !prefs.isSetUp) {
+            refreshPhaseFromDisk()
+            return
+        }
+        busy = true
+        error = null
+        viewModelScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                if (DeadlineEnforcer.check(app) || !prefs.isSetUp) {
+                    Unlock.Wiped
+                } else {
+                    DeadlineEnforcer.markUnlocked(app)
+                    loadVault()
+                }
+            }
+            busy = false
+            handleUnlock(outcome)
+        }
+    }
+
+    private fun disableBiometricBecauseInvalidated() {
+        BiometricHelper.deleteKey()
+        biometricEnabled = false
+        viewModelScope.launch(Dispatchers.IO) { prefs.biometricEnabled = false }
+        error = "Biometric unlock was turned off because the phone's fingerprints or face data changed. " +
+            "Unlock with your passcode, then switch it on again in Settings."
+    }
+
+    /** Settings switch. Turning it on asks for one biometric check to prove it works. */
+    fun setBiometric(enable: Boolean, activity: FragmentActivity?) {
+        if (!enable) {
+            BiometricHelper.deleteKey()
+            biometricEnabled = false
+            viewModelScope.launch(Dispatchers.IO) { prefs.biometricEnabled = false }
+            return
+        }
+        if (activity == null) return
+        if (!BiometricHelper.isAvailable(app)) {
+            message = "No strong fingerprint or face unlock is set up on this phone. Add one in Android settings first."
+            return
+        }
+        try {
+            BiometricHelper.createKey()
+        } catch (e: Exception) {
+            message = "This phone couldn't create a biometric key."
+            return
+        }
+        BiometricHelper.authenticate(activity, "Confirm to turn on biometric unlock", "Cancel") { result ->
+            when (result) {
+                BiometricResult.Success -> {
+                    biometricEnabled = true
+                    viewModelScope.launch(Dispatchers.IO) { prefs.biometricEnabled = true }
+                    message = "Biometric unlock is on."
+                }
+                is BiometricResult.Error -> {
+                    BiometricHelper.deleteKey()
+                    message = result.message
+                }
+                else -> BiometricHelper.deleteKey()
+            }
+        }
+    }
+
     // ------------------------------------------------------------ browsing
 
     suspend fun thumb(id: String): Bitmap? {
@@ -268,11 +444,13 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { store.deletePlayback(file) }
     }
 
+    /** [index] is a position in [visibleItems]. */
     fun openViewer(index: Int) {
         overlay = Overlay.Viewer(index)
     }
 
     fun openSettings() {
+        refreshPermissions()
         overlay = Overlay.Settings
     }
 
@@ -281,14 +459,116 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
         clearPlaybackAsync()
     }
 
+    fun folderItemCount(folderId: String): Int = items.count { it.folderId == folderId }
+
     // ----------------------------------------------------------- selection
 
     fun toggleSelected(id: String) {
         selection = if (id in selection) selection - id else selection + id
     }
 
+    fun selectAllVisible() {
+        selection = visibleItems.map { it.id }.toSet()
+    }
+
     fun clearSelection() {
         selection = emptySet()
+    }
+
+    // -------------------------------------------------------------- folders
+
+    fun openFolder(id: String?) {
+        selection = emptySet()
+        currentFolderId = id
+    }
+
+    /** Creates a folder; with [moveSelection] the currently selected items are moved into it. */
+    fun createFolder(name: String, moveSelection: Boolean) {
+        val clean = name.trim()
+        if (clean.isEmpty()) return
+        viewModelScope.launch {
+            val folder = withContext(Dispatchers.IO) { runCatching { store.createFolder(clean) }.getOrNull() }
+            if (folder == null) {
+                message = "Couldn't create the folder."
+                return@launch
+            }
+            folders.add(folder)
+            folders.sortBy { it.name.lowercase() }
+            if (moveSelection) moveSelected(folder.id) else message = "Folder \"${folder.name}\" created."
+        }
+    }
+
+    fun renameFolder(id: String, name: String) {
+        val clean = name.trim()
+        val folder = folders.firstOrNull { it.id == id } ?: return
+        if (clean.isEmpty()) return
+        viewModelScope.launch {
+            val updated = withContext(Dispatchers.IO) { runCatching { store.renameFolder(folder, clean) }.getOrNull() }
+            if (updated == null) {
+                message = "Couldn't rename the folder."
+                return@launch
+            }
+            val i = folders.indexOfFirst { it.id == id }
+            if (i >= 0) folders[i] = updated
+            folders.sortBy { it.name.lowercase() }
+        }
+    }
+
+    /** Deleting a folder never deletes its photos: they go back to the main library. */
+    fun deleteFolder(id: String) {
+        val folder = folders.firstOrNull { it.id == id } ?: return
+        val inside = items.filter { it.folderId == id }
+        viewModelScope.launch {
+            val moved = withContext(Dispatchers.IO) {
+                runCatching {
+                    val result = inside.map { it.copy(folderId = null).also { updated -> store.updateItem(updated) } }
+                    store.deleteFolder(id)
+                    result
+                }.getOrNull()
+            }
+            if (moved == null) {
+                message = "Couldn't delete the folder. Nothing was lost."
+                return@launch
+            }
+            replaceItems(moved)
+            folders.remove(folder)
+            if (currentFolderId == id) currentFolderId = null
+            message = if (moved.isEmpty()) {
+                "Folder deleted."
+            } else {
+                "Folder deleted. Its ${moved.size} items are back in the main library."
+            }
+        }
+    }
+
+    /** Moves the selected items to [folderId] (null = main library). */
+    fun moveSelected(folderId: String?) {
+        val ids = selection
+        val targets = items.filter { it.id in ids && it.folderId != folderId }
+        if (targets.isEmpty()) {
+            selection = emptySet()
+            return
+        }
+        val label = folders.firstOrNull { it.id == folderId }?.name ?: "the main library"
+        viewModelScope.launch {
+            val moved = withContext(Dispatchers.IO) {
+                // Per item, so one failure doesn't stop the rest; only items that really moved are updated.
+                targets.mapNotNull { item ->
+                    val updated = item.copy(folderId = folderId)
+                    if (runCatching { store.updateItem(updated) }.isSuccess) updated else null
+                }
+            }
+            replaceItems(moved)
+            selection = emptySet()
+            message = "Moved ${moved.size} to $label."
+        }
+    }
+
+    private fun replaceItems(updated: List<VaultItem>) {
+        updated.forEach { u ->
+            val i = items.indexOfFirst { it.id == u.id }
+            if (i >= 0) items[i] = u
+        }
     }
 
     // --------------------------------------------------- import / restore
@@ -296,58 +576,63 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
     fun importUris(uris: List<Uri>) {
         expireIfStale()
         if (uris.isEmpty() || phase != Phase.Unlocked) return
-        busy = true
+        val target = currentFolderId
+        val silent = autoDelete && OriginalDeleter.canDeleteSilently()
+        working = true
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
-                val done = mutableListOf<VaultItem>()
-                val sources = mutableListOf<Uri>()
+                val added = mutableListOf<VaultItem>()
+                val leftovers = mutableListOf<Uri>()
                 var failed = 0
+                var deleted = 0
                 for (uri in uris) {
-                    val item = store.import(uri)
-                    if (item != null) {
-                        done += item
-                        sources += uri
-                    } else {
+                    val item = store.import(uri, target)
+                    if (item == null) {
                         failed++
+                        continue
+                    }
+                    // Read the encrypted copy back before anything else happens to the original. A copy that
+                    // doesn't check out is thrown away and the original is left exactly where it was.
+                    if (!store.verify(item)) {
+                        store.delete(item.id)
+                        failed++
+                        continue
+                    }
+                    added += item
+                    if (silent && OriginalDeleter.delete(app, uri)) {
+                        deleted++
+                    } else {
+                        leftovers += uri
                     }
                 }
-                Triple(done, sources, failed)
+                ImportResult(added, leftovers, failed, deleted)
             }
-            val (done, sources, failed) = result
-            items.addAll(0, done)
-            busy = false
+            working = false
+            // The vault may have been locked (or wiped) while this ran; the items are stored and will
+            // appear at the next unlock, so there is nothing to show now.
+            if (phase != Phase.Unlocked) return@launch
+
+            items.addAll(0, result.added)
             message = buildString {
-                append("Added ${done.size} to the vault.")
-                if (failed > 0) append(" $failed couldn't be imported.")
+                append("Added ${result.added.size} to the vault.")
+                if (result.deleted > 0) append(" Removed ${result.deleted} from your gallery.")
+                if (silent && result.leftoverOriginals.isNotEmpty()) {
+                    append(" ${result.leftoverOriginals.size} originals couldn't be removed automatically.")
+                }
+                if (result.failed > 0) append(" ${result.failed} couldn't be imported; those were not touched.")
             }
-            offerOriginalsDeletion(sources)
+            // Anything that couldn't be removed silently falls back to Android's confirmation dialog
+            // (only ever for items whose encrypted copy has been verified).
+            offerOriginalsDeletion(result.leftoverOriginals)
         }
     }
 
-    /**
-     * The originals are still in the gallery after import. Ask Android to delete them (the user
-     * confirms in a system dialog). Only items chosen through the system Photos/Videos browser
-     * can be mapped back to MediaStore; anything else is left alone.
-     */
     private fun offerOriginalsDeletion(sources: List<Uri>) {
-        val mediaUris = sources.mapNotNull { toMediaStoreUri(it) }
+        val mediaUris = sources.mapNotNull { OriginalDeleter.toMediaStoreUri(it) }
         if (mediaUris.isEmpty()) return
         runCatching {
             deleteRequest = MediaStore.createDeleteRequest(app.contentResolver, mediaUris).intentSender
         }
-    }
-
-    private fun toMediaStoreUri(uri: Uri): Uri? {
-        if (uri.authority != "com.android.providers.media.documents") return null
-        val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() ?: return null
-        val (kind, idStr) = docId.split(":", limit = 2).let { if (it.size == 2) it[0] to it[1] else return null }
-        val id = idStr.toLongOrNull() ?: return null
-        val base = when (kind) {
-            "image" -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-            "video" -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-            else -> return null
-        }
-        return ContentUris.withAppendedId(base, id)
     }
 
     fun restoreSelected() = restore(selection.toList())
@@ -355,14 +640,15 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
     fun restore(ids: List<String>) {
         val targets = items.filter { it.id in ids }
         if (targets.isEmpty()) return
-        busy = true
+        working = true
         viewModelScope.launch {
             val restored = withContext(Dispatchers.IO) {
                 targets.filter { item -> store.exportToGallery(item).also { ok -> if (ok) store.delete(item.id) } }
             }
+            working = false
+            if (phase != Phase.Unlocked) return@launch
             items.removeAll(restored.toSet())
             selection = emptySet()
-            busy = false
             message = "Restored ${restored.size} to your gallery (Pictures / Movies › DeadVault Restored)."
         }
     }
@@ -379,6 +665,11 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------ settings
+
+    fun setAutoDelete(enabled: Boolean) {
+        autoDelete = enabled
+        viewModelScope.launch(Dispatchers.IO) { prefs.autoDeleteOriginals = enabled }
+    }
 
     fun changeInterval(ms: Long) {
         viewModelScope.launch {

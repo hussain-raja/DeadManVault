@@ -23,21 +23,25 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.deadvault.app.BuildConfig
+import kotlinx.coroutines.delay
 import java.text.DateFormat
 import java.util.Date
 
@@ -167,6 +171,15 @@ fun PasscodeField(
 fun LockScreen(vm: VaultViewModel) {
     var passcode by rememberSaveable { mutableStateOf("") }
 
+    // Offer the fingerprint / face prompt automatically whenever the lock screen appears or is resumed.
+    val activity = LocalContext.current.findFragmentActivity()
+    LaunchedEffect(vm.biometricTrigger, vm.biometricEnabled) {
+        if (vm.biometricEnabled && activity != null) {
+            delay(300)
+            vm.requestBiometric(activity, auto = true)
+        }
+    }
+
     Column(
         Modifier
             .fillMaxSize()
@@ -203,6 +216,14 @@ fun LockScreen(vm: VaultViewModel) {
             modifier = Modifier.fillMaxWidth(),
         ) {
             if (vm.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Text("Unlock")
+        }
+        if (vm.biometricEnabled && activity != null) {
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = { vm.requestBiometric(activity, auto = false) },
+                enabled = !vm.busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Use fingerprint / face") }
         }
         Spacer(Modifier.width(1.dp))
     }
