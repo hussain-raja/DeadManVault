@@ -775,7 +775,7 @@ private fun SettingsScreen(vm: VaultViewModel) {
 
         SectionTitle("Originals")
         SwitchRow("Delete originals automatically", vm.autoDelete) {
-            vm.setAutoDelete(it)
+            vm.changeAutoDelete(it)
             if (it && !vm.hasAllFilesAccess) openAllFilesSettings()
         }
         if (vm.autoDelete && !vm.hasAllFilesAccess) {

@@ -666,7 +666,7 @@ class VaultViewModel(private val app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------ settings
 
-    fun setAutoDelete(enabled: Boolean) {
+    fun changeAutoDelete(enabled: Boolean) {
         autoDelete = enabled
         viewModelScope.launch(Dispatchers.IO) { prefs.autoDeleteOriginals = enabled }
     }
